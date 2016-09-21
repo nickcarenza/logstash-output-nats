@@ -3,6 +3,7 @@
 require "logstash/outputs/base"
 require "logstash/namespace"
 
+require "io/wait"
 require "json"
 require "socket"
 require "thread"
@@ -55,10 +56,12 @@ class NatsConnection
 
       @thread = Thread.new do
         loop do
-          result = receive
+          if has_data?
+            result = receive
 
-          if result =~ /^PING/
-            send "PONG"
+            if result =~ /^PING/
+              send "PONG"
+            end
           end
 
           sleep 0.1
@@ -71,6 +74,11 @@ class NatsConnection
   def connected?
     # probably should actually ping the server here
     @socket != nil
+  end
+
+  public
+  def has_data?
+    @socket.ready?
   end
 
   private
@@ -117,6 +125,7 @@ class NatsConnection
   private
   def send(data)
     @mutex.synchronize do
+      # should probably check for "+OK" here
       @socket.puts data
     end
   end
@@ -124,12 +133,12 @@ end
 
 # A NATS output for logstash
 class LogStash::Outputs::Nats < LogStash::Outputs::Base
+  conn = nil
+
   config_name "nats"
 
-  default :codec, "json"
-
-  # The subject to use
-  config :key, :validate => :string, :required => true
+  # # The subject to use
+  config :subject, :validate => :string, :required => true
 
   # The hostname or IP address to reach your NATS instance
   config :host, :validate => :string, :default => "nats://0.0.0.0:4222", :required => true
@@ -154,10 +163,20 @@ class LogStash::Outputs::Nats < LogStash::Outputs::Base
   #
   # Only the `#multi_receive/#multi_receive_encoded` methods need to actually be threadsafe, the other methods
   # will only be executed in a single thread
-  concurrency :single
+  # concurrency :single
+  # ^ seems to frag plugin loading, "NoMethodError"
 
   def close
     puts "close"
+  end
+
+  def get_nats_connection
+    if @conn == nil
+      @logger.debug "NATS: connecting to #{@host}"
+      @conn = NatsConnection.new @host
+    end
+
+    @conn
   end
 
   # Needed for logstash < 2.2 compatibility
@@ -167,49 +186,31 @@ class LogStash::Outputs::Nats < LogStash::Outputs::Base
       return
     end
 
-    @codec.encode(event)
+    begin
+      @logger.debug "NATS: Encoding event"
+      @codec.encode event
+    rescue LocalJumpError
+      # This LocalJumpError rescue clause is required to test for regressions
+      # for https://github.com/logstash-plugins/logstash-output-redis/issues/26
+      # see specs. Without it the LocalJumpError is rescued by the StandardError
+      raise
+    rescue StandardError => e
+      @logger.warn "NATS: Error encoding event", :exception => e, :event => event
+    end
   end
 
   def register
-    # NATS.on_connect do
-    #   @logger.debug("NATS: connected")
-    # end
-
-    # NATS.on_error do |e|
-    #   @logger.warn("NATS: error", :error => e)
-    # end
-
-    # NATS.on_disconnect do |reason|
-    #   @logger.warn("NATS: disconnected", :reason => reason)
-    # end
-
-    # NATS.on_reconnect do |nats|
-    #   @logger.warn("NATS: reconnected", :server => nats.connected_server)
-    # end
-
-    # NATS.on_close do
-    #   @logger.warn("NATS: connection closed")
-    # end
-
-    @codec.on_event(&method(:send_to_nats))
+    @codec.on_event &method(:send_to_nats)
   end
 
   def send_to_nats(event, payload)
-    key = event.sprintf(@key)
-    opts = {
-      :dont_randomize_servers => !@randomize_servers,
-      :reconnect_time_wait => @reconnect_time_wait,
-      :max_reconnect_attempts => @max_reconnect_attempts,
-      :servers => @servers,
-    }
-
-    @logger.debug("NATS: publishing event #{key}")
+    key = event.sprintf @subject
+    @logger.debug "NATS: publishing event #{key}"
 
     begin
       retries ||= 0
-      @logger.debug("NATS: connecting to #{opts[:servers]}")
-      conn = NatsConnection.new opts[:servers][0]
-      conn.publish(key, payload)
+      conn = get_nats_connection
+      conn.publish key, payload
     rescue => e
       @logger.warn("NATS: failed to send event",
         :event => event,
