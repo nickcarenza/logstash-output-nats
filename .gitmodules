@@ -1,3 +1,0 @@
-[submodule "cnats"]
-	path = cnats
-	url = https://github.com/nats-io/cnats.git
