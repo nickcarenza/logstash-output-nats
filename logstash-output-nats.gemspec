@@ -20,6 +20,7 @@ Gem::Specification.new do |s|
   # Gem dependencies
   s.add_runtime_dependency "logstash-core-plugin-api", ">= 1.60", "<= 2.99"
   s.add_runtime_dependency "logstash-codec-json"
+  s.add_runtime_dependency "nats", "~> 0.8"
 
   # Gem development dependencies
   s.add_development_dependency "logstash-devutils"
